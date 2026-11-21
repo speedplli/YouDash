@@ -242,16 +242,32 @@ static id YCPReadObject(id object, NSString *name) {
     [window makeKeyAndVisible];
     YCPLog(@"Native phone window activated alongside CarPlay");
 }
+// A template connection does not imply that iOS will provide a drawable window.
+// Refresh on window arrival/loss as well as initial template connection.
+- (void)refreshTemplate {
+    CPInterfaceController *controller = self.interfaceController;
+    if (!controller) return;
+    NSArray *sections = @[];
+    if (!self.activeWindow) {
+        CPListItem *item = [[CPListItem alloc] initWithText:@"CarPlay interface unavailable"
+            detailText:@"This CarPlay connection cannot display YouDash. Check vehicle video support or try a supported simulator configuration."];
+        item.enabled = NO;
+        sections = @[[[CPListSection alloc] initWithItems:@[item]]];
+    }
+    [controller setRootTemplate:[[CPListTemplate alloc] initWithTitle:@"YouDash" sections:sections]
+        animated:NO completion:nil];
+}
 - (void)connectTemplate:(CPInterfaceController *)controller window:(CPWindow *)window {
     YCPLog(@"Template connected: window=%@", window ? NSStringFromCGRect(window.bounds) : @"none");
     self.interfaceController = controller;
     self.templateWindow = window;
-    if (self.activeWindow) {
-        [controller setRootTemplate:[[CPListTemplate alloc] initWithTitle:@"YouTube" sections:@[]] animated:NO completion:nil];
-    } else {
-        CPListItem *item = [[CPListItem alloc] initWithText:@"Waiting for a CarPlay window" detailText:@"Native YouTube needs a drawable car display. Open YouDash on your iPhone to finish setup."];
-        [controller setRootTemplate:[[CPListTemplate alloc] initWithTitle:@"YouTube" sections:@[[[CPListSection alloc] initWithItems:@[item]]]] animated:NO completion:nil];
+    if (!self.activeWindow) {
+        NSMutableArray<NSString *> *roles = [NSMutableArray array];
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes)
+            [roles addObject:[NSString stringWithFormat:@"%@:%@", scene.session.role, NSStringFromClass(scene.class)]];
+        YCPLog(@"No drawable window; connected scene roles/classes=%@", roles);
     }
+    [self refreshTemplate];
     [self reconcile];
 }
 - (void)disconnectTemplate {
@@ -267,6 +283,7 @@ static id YCPReadObject(id object, NSString *name) {
     if (self.sceneWindow != window && self.sceneWindow.rootViewController == self.host)
         self.sceneWindow.rootViewController = nil;
     self.sceneWindow = window;
+    [self refreshTemplate];
     [self reconcile];
 }
 - (void)disconnectWindow:(UIWindow *)window {
@@ -274,6 +291,7 @@ static id YCPReadObject(id object, NSString *name) {
     if (self.sceneWindow != window) return;
     self.sceneWindow = nil;
     if (window.rootViewController == self.host) window.rootViewController = nil;
+    [self refreshTemplate];
     [self reconcile];
 }
 - (UIWindow *)findPhoneWindow {
