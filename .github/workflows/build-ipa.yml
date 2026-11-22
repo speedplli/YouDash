@@ -1,0 +1,181 @@
+name: Build YouDash IPA
+
+# Always compiles and verifies the CarPlay module. When the YOUTUBE_IPA_URL
+# secret is set, it also packages an IPA from your own decrypted
+# YouTube + YouMod IPA. With signing secrets it produces a signed IPA,
+# otherwise an unsigned one. See docs/GITHUB_ACTIONS.md for the secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reported_version:
+        description: Bundle version to report ("native" keeps the real version)
+        default: "21.45.4"
+        required: true
+      bundle_id:
+        description: Bundle ID for unsigned builds (signed builds use the profile's App ID)
+        default: io.github.youtubecar.app
+        required: true
+  push:
+    branches: ["**"]
+    paths:
+      - "CarPlay/**"
+      - "scripts/**"
+      - "tests/**"
+      - "requirements-build.txt"
+      - ".github/workflows/build-ipa.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      PYTHONUNBUFFERED: "1"
+      HAS_IPA: ${{ secrets.YOUTUBE_IPA_URL != '' }}
+      HAS_SIGNING: ${{ secrets.SIGNING_CERT_P12_BASE64 != '' && secrets.PROVISIONING_PROFILE_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Select newest Xcode
+        run: |
+          newest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$newest" ]; then sudo xcode-select -s "$newest/Contents/Developer"; fi
+          xcodebuild -version
+          echo "iPhoneOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m cyan --help > /dev/null
+
+      - name: Run packaging unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile and verify CarPlay module
+        run: |
+          python scripts/build_carplay.py --compile-only
+          test "$(xcrun lipo -archs build/YouTubeCarPlay.dylib)" = arm64
+          xcrun otool -D build/YouTubeCarPlay.dylib | grep -Fx '@rpath/YouTubeCarPlay.dylib'
+          (cd build && shasum -a 256 YouTubeCarPlay.dylib > SHA256SUMS)
+
+      - name: Upload CarPlay module
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouTubeCarPlay-dylib
+          path: |
+            build/YouTubeCarPlay.dylib
+            build/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Skip IPA packaging (no YOUTUBE_IPA_URL secret)
+        if: env.HAS_IPA != 'true'
+        run: echo "::notice::Module built. Add the YOUTUBE_IPA_URL secret to also build an IPA (see docs/GITHUB_ACTIONS.md)."
+
+      - name: Require artifact password
+        if: env.HAS_IPA == 'true'
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          if [ -z "$ARTIFACT_PASSWORD" ]; then
+            echo "::error::Set the ARTIFACT_PASSWORD secret. The IPA contains Google's YouTube app and must not be uploaded unencrypted from a public repository."
+            exit 1
+          fi
+
+      - name: Download input IPA
+        if: env.HAS_IPA == 'true'
+        env:
+          IPA_URL: ${{ secrets.YOUTUBE_IPA_URL }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/input"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/input/input.ipa" "$IPA_URL"
+          unzip -tq "$RUNNER_TEMP/input/input.ipa" > /dev/null || { echo "::error::Downloaded file is not a valid IPA (zip)"; exit 1; }
+          unzip -l "$RUNNER_TEMP/input/input.ipa" | grep -q 'Payload/.*\.app/Info.plist' || { echo "::error::No Payload/*.app in the IPA"; exit 1; }
+
+      - name: Import signing certificate and profile
+        if: env.HAS_IPA == 'true' && env.HAS_SIGNING == 'true'
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")"
+          if ! /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.carplay-video' "$RUNNER_TEMP/profile.plist" 2>/dev/null | grep -q true; then
+            echo "::error::This provisioning profile does not include com.apple.developer.carplay-video. CarPlay video will not work with it."
+            exit 1
+          fi
+          echo "PROFILE_BUNDLE_ID=${app_id#*.}" >> "$GITHUB_ENV"
+
+      - name: Build signed IPA
+        if: env.HAS_IPA == 'true' && env.HAS_SIGNING == 'true'
+        env:
+          REPORTED: ${{ inputs.reported_version || '21.45.4' }}
+        run: |
+          python scripts/build_carplay.py \
+            --ipa "$RUNNER_TEMP/input/input.ipa" \
+            --profile "$RUNNER_TEMP/profile.mobileprovision" \
+            --bundle-id "$PROFILE_BUNDLE_ID" \
+            --reported-version "$REPORTED"
+
+      - name: Build unsigned IPA
+        if: env.HAS_IPA == 'true' && env.HAS_SIGNING != 'true'
+        env:
+          REPORTED: ${{ inputs.reported_version || '21.45.4' }}
+          BUNDLE_ID: ${{ inputs.bundle_id || 'io.github.youtubecar.app' }}
+        run: |
+          python scripts/build_carplay.py \
+            --ipa "$RUNNER_TEMP/input/input.ipa" \
+            --unsigned \
+            --bundle-id "$BUNDLE_ID" \
+            --reported-version "$REPORTED"
+
+      - name: Encrypt IPA
+        if: env.HAS_IPA == 'true'
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+        run: |
+          command -v 7z > /dev/null || brew install sevenzip
+          seven="$(command -v 7z || command -v 7zz)"
+          mkdir -p out
+          "$seven" a -tzip -mem=AES256 -p"$ARTIFACT_PASSWORD" out/YouDash-ipa.zip ./dist/*.ipa ./dist/build-manifest.json > /dev/null
+          ls -lh out
+
+      - name: Upload encrypted IPA
+        if: env.HAS_IPA == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: YouDash-ipa-encrypted
+          path: out/YouDash-ipa.zip
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Clean up signing keychain
+        if: always() && env.HAS_SIGNING == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/profile.mobileprovision" "$RUNNER_TEMP/profile.plist"
