@@ -92,6 +92,8 @@ Use your own bundle ID, profile, and device ID. For an **unsigned IPA**, replace
 
 **[Full build guide →](docs/BUILD.md)** — prerequisites, unsigned export, signing, module updates, and troubleshooting.
 
+**No Mac?** [Build on GitHub Actions →](docs/GITHUB_ACTIONS.md). It uses a macOS runner, takes your input IPA and signing material from repository secrets, and uploads an encrypted IPA.
+
 ### About the CarPlay entitlement
 
 Your provisioning profile must permit:

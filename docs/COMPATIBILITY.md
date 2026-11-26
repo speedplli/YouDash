@@ -48,3 +48,45 @@ An AVPlayer-backend replacement was considered but **not included** in this base
 ## Report a useful issue
 
 Include actual and reported versions, OS version, viewport dimensions, whether the issue affects phone/car/both, and exact reproduction steps. A cropped screenshot may help, but remove account names, notifications, location, and unrelated desktop content. Do not upload your provisioning profile, account state, raw app container, or unreviewed logs.
+
+## Investigation of issue #3 (November 21, 2026)
+
+The report establishes that iOS connected a template scene without a drawable
+window. It does not establish an iOS 27.3 regression: the same binary/profile
+needs an A/B test on the earlier OS and the same simulator configuration.
+
+Apple's [WWDC26 CarPlay session](https://developer.apple.com/videos/play/wwdc2026/212/)
+describes video apps as a CarPlay-template browsing interface with AirPlay video
+streaming in supported vehicles. The video entitlement is not a promise of a
+custom UIKit window. The SDK's `CPSessionConfiguration.supportsVideoPlayback`
+indicates vehicle video support, not the availability of an arbitrary drawable
+scene or permission to play video at a particular moment.
+
+This integration instead waits for a drawable scene and moves YouTube's native
+view-controller tree into it. An Info.plist scene declaration registers a
+handler; it does not force iOS to create that scene. Changing scene class names,
+retrying phone startup, or adding unauthorized entitlements is not a supported
+fix for an absent window. A supported template browser and AirPlay playback
+adapter would be a separate implementation, with device validation required.
+
+The local mitigation makes the missing-window screen explicit, logs only the
+connected scene roles/classes, and refreshes the template when a window arrives
+or disappears. It does **not** claim to restore video or solve the reported OS
+compatibility problem. Native harness coverage includes template-only startup,
+both connection arrival orders, late window arrival, window loss, stale window
+disconnects, and restoration of the phone UI. A harness-created window tests our
+lifecycle handling, not whether a real CarPlay session will supply that window.
+
+For device investigation after approval, compare the same signed IPA on the
+reported and baseline OS versions using the same supported simulator profile.
+Record whether the template callback includes a window, whether a separate
+window scene connects, and `supportsVideoPlayback`. Test actual video playback
+only while parked and let the system/vehicle enforce playback availability.
+
+Validation on the local iOS 26.2 simulator: the focused fallback harness passes
+(`tests/run_native_surface.py SIMULATOR_UDID --fallback-only`), and the native
+module compiles against the iOS 27.2 SDK. All five packaging tests pass. The
+existing full surface harness fails its tablet-layout-trait assertion on both
+unchanged upstream commit `47041e9` and this patch. That unrelated baseline
+failure remains unresolved; full native regression coverage is not claimed.
+No iOS 27.3/physical CarPlay playback test has been performed.
